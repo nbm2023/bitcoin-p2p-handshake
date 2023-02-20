@@ -1,7 +1,5 @@
 use bitcoin::consensus::serialize;
-use bitcoin::consensus::Encodable;
-use bitcoin::network::constants::Network;
-use bitcoin::network::message::NetworkMessage;
+use bitcoin::network::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::network::message_network::VersionMessage;
 use std::io::Read;
 use std::io::Write;
@@ -38,8 +36,14 @@ fn handshake() {
         start_height: 0,
         relay: false,
     };
+
+    let network_message = RawNetworkMessage {
+        magic: 0,
+        payload: NetworkMessage::Version(version_message),
+    };
+
     writer
-        .write_all(serialize(&version_message).as_slice())
+        .write_all(serialize(&network_message).as_slice())
         .unwrap();
     writer.flush().unwrap();
 
@@ -47,28 +51,7 @@ fn handshake() {
     loop {
         let mut buf = [0u8; 1024];
         let res = reader.read(&mut buf).unwrap();
-        println!("Res: {:?}", res); // ---> Always empty
-
-        // let message = from_reader(&mut reader).unwrap();
-        // match message {
-        //     NetworkMessage::Version(_) => {
-        //         // Send a verack message to the node
-        //         // let verack_message = NetworkMessage::Verack;
-        //         // writer
-        //         //     .write_all(serialize(&verack_message).as_slice())
-        //         //     .unwrap();
-        //         // writer.flush().unwrap();
-        //         println!("node requested a version");
-        //         break;
-        //     }
-        //     NetworkMessage::Verack => {
-        //         println!("node acknowledged the version");
-        //     }
-        //     NetworkMessage::Reject(_) => {
-        //         panic!("Handshake rejected by node");
-        //     }
-        //     _ => (),
-        // }
+        println!("Res: {:?}", res); // ---> Always 0
     }
 
     println!("Handshake completed successfully");
