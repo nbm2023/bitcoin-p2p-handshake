@@ -64,7 +64,7 @@ fn handshake() {
 
     // Send a version message to the node
     let version_message = VersionMessage {
-        version: 80015,
+        version: 70015,
         services: 0,
         timestamp: chrono::Utc::now().timestamp() as i64,
         addr_recv: NetworkAddress {
@@ -84,10 +84,13 @@ fn handshake() {
     };
 
     let mut buf = Vec::new();
+    // magic for main network
     buf.extend_from_slice(b"0xD9B4BEF9");
+    // has to be 12 bytes
     buf.extend_from_slice(&"version".as_bytes());
     buf.resize(12, 0);
     buf.extend_from_slice(&(version_message.to_bytes().len() as u32).to_le_bytes());
+    // todo: this checksum is not correct, maybe that's my issue :?
     buf.extend_from_slice(&0u32.to_le_bytes());
     buf.extend_from_slice(&version_message.to_bytes());
     let res = stream.write_all(&buf);
