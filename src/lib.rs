@@ -15,7 +15,7 @@ fn test_handshake() {
     handshake();
 }
 
-const PROTOCOL_VERSION: i32 = 80000;
+const PROTOCOL_VERSION: i32 = 70015;
 // 0xd9b4bef9 is the magic for "main" Bitcoin network
 const BTC_MAIN_MAGIC: u32 = 3652501241;
 
