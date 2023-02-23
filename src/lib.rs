@@ -15,22 +15,23 @@ fn test_handshake() {
     handshake();
 }
 
-const PROTOCOL_VERSION: i32 = 70015;
+const PROTOCOL_VERSION: i32 = 70002;
 // 0xd9b4bef9 is the magic for "main" Bitcoin network
-const BTC_MAIN_MAGIC: u32 = 3652501241;
+// const BTC_MAIN_MAGIC: u32 = 3652501241;
+const BTC_MAIN_MAGIC: [u8; 4] = [0xf9, 0xbe, 0xb4, 0xd9];
 
 #[derive(Debug)]
 struct NetworkAddress {
-    services: u64,
     ip: [u8; 16],
+    services: u64,
     port: u16,
 }
 impl NetworkAddress {
     fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(26);
-        bytes.extend_from_slice(&self.services.to_le_bytes());
         // IP and Port need to be Big Endian. The IP is already passed as big endian.
         bytes.extend_from_slice(&self.ip);
+        bytes.extend_from_slice(&self.services.to_le_bytes());
         bytes.extend_from_slice(&self.port.to_be_bytes());
         bytes
     }
@@ -79,7 +80,9 @@ impl VersionMessage {
 
 fn handshake() {
     // Connect to a Bitcoin node on the main network
-    let mut stream = TcpStream::connect("seed.bitcoin.sipa.be:8333").unwrap();
+    let ip = "seed.bitcoin.sipa.be";
+    let port = 8333;
+    let mut stream = TcpStream::connect((ip, port)).expect("Failed to connect to node");
 
     // Big endian represenation of the "seed.bitcoin.sipa.be" address
     let ipv6_address: std::net::Ipv6Addr = "::ffff:185.49.141.1".parse().unwrap();
@@ -102,17 +105,19 @@ fn handshake() {
             port: 0,
         },
         nonce: 0,
-        user_agent: "/bitcoin-rs:0.1.0/".to_string(),
+        user_agent: "".to_string(),
         start_height: 0,
         relay: false,
     };
 
     let mut buf = Vec::new();
     // 4	magic	uint32_t	Magic value indicating message origin network, and used to seek to next message when stream state is unknown
-    buf.extend_from_slice(&BTC_MAIN_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&BTC_MAIN_MAGIC);
+
     // 12	command	char[12]	ASCII string identifying the packet content, NULL padded (non-NULL padding results in packet rejected)
     buf.extend_from_slice(&"version".as_bytes());
-    buf.resize(12, 0);
+    buf.resize(buf.len() + 5, 0);
+
     // 4	length	uint32_t	Length of payload in number of bytes
     buf.extend_from_slice(&(version_message.to_bytes().len() as u32).to_le_bytes());
     // 4	checksum	uint32_t	First 4 bytes of sha256(sha256(payload))
@@ -124,13 +129,26 @@ fn handshake() {
     buf.extend_from_slice(&version_message_bytes);
 
     let res = stream.write_all(&buf);
+    println!("Write buf: {:?}", buf);
     println!("Write res: {:?}", res);
 
     loop {
         let mut reader = BufReader::new(&stream);
         let mut buf = [0u8; 1024];
         let res = reader.read(&mut buf).unwrap();
-        // println!("Read res: {:?}", buf); // ---> Always empty
+        println!("Read res: {:?}", buf); // ---> Always empty
+
+        let command_bytes = &buf[4..16];
+        println!("command_bytes: {:?}", command_bytes); // ---> Always empty
+    
+        // Parse the command bytes into a string and trim the null characters.
+        let command = std::str::from_utf8(&command_bytes)
+            .unwrap()
+            .trim_end_matches('\0')
+            .to_owned();
+
+        println!("Returned command str: {:?}", command);
+
         if res != 0 {break;};
     }
 
