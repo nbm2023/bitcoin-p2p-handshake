@@ -1,24 +1,11 @@
-use bitcoin::consensus::serialize;
-use bitcoin_hashes::hex::ToHex;
-// use bitcoin::network::message::{NetworkMessage, RawNetworkMessage};
-// use bitcoin::network::message_network::VersionMessage;
-use std::io::Read;
-use std::io::Write;
-use std::io::{BufReader, BufWriter};
-use std::net::TcpStream;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#![allow(dead_code)]
+
 use bitcoin_hashes::{sha256d, Hash};
-
-
-#[test]
-fn test_handshake() {
-    handshake();
-}
-
-const PROTOCOL_VERSION: i32 = 70002;
-// 0xd9b4bef9 is the magic for "main" Bitcoin network
-// const BTC_MAIN_MAGIC: u32 = 3652501241;
-const BTC_MAIN_MAGIC: [u8; 4] = [0xf9, 0xbe, 0xb4, 0xd9];
+use tokio::io::AsyncWriteExt;
+use tokio::{
+    io::{split, AsyncReadExt, ReadHalf},
+    net::TcpStream,
+};
 
 #[derive(Debug)]
 struct NetworkAddress {
@@ -26,41 +13,30 @@ struct NetworkAddress {
     services: u64,
     port: u16,
 }
+
 impl NetworkAddress {
     fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(26);
-        // IP and Port need to be Big Endian. The IP is already passed as big endian.
         bytes.extend_from_slice(&self.ip);
         bytes.extend_from_slice(&self.services.to_le_bytes());
         bytes.extend_from_slice(&self.port.to_be_bytes());
         bytes
     }
 }
+
 #[derive(Debug)]
 struct VersionMessage {
-    // 4	version	int32_t	Identifies protocol version being used by the node
     version: i32,
-    // 8	services	uint64_t	bitfield of features to be enabled for this connection
     services: u64,
-    // 8	timestamp	int64_t	standard UNIX timestamp in seconds
     timestamp: i64,
-    // 26	addr_recv	net_addr	The network address of the node receiving this message
     addr_recv: NetworkAddress,
-
-    // Fields below require version ≥ 106
-    // 26	addr_from	net_addr	Field can be ignored. This used to be the network address of the node emitting this message, but most P2P implementations send 26 dummy bytes. The "services" field of the address would also be redundant with the second field of the version message.
     addr_from: NetworkAddress,
-    // 8	nonce	uint64_t	Node random nonce, randomly generated every time a version packet is sent. This nonce is used to detect connections to self.
     nonce: u64,
-    // ?	user_agent	var_str	User Agent (0x00 if string is 0 bytes long)
     user_agent: String,
-    // 4	start_height	int32_t	The last block received by the emitting node
     start_height: i32,
-
-    // Fields below require version ≥ 70001
-    // 1	relay	bool	Whether the remote peer should announce relayed transactions or not, see BIP 0037
     relay: bool,
 }
+
 impl VersionMessage {
     fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(85 + self.user_agent.len());
@@ -78,26 +54,24 @@ impl VersionMessage {
     }
 }
 
-fn handshake() {
-    // Connect to a Bitcoin node on the main network
-    let ip = "seed.bitcoin.sipa.be";
-    let port = 8333;
-    let mut stream = TcpStream::connect((ip, port)).expect("Failed to connect to node");
+const PROTOCOL_VERSION: i32 = 70002;
+const BTC_MAIN_MAGIC: [u8; 4] = [0xf9, 0xbe, 0xb4, 0xd9];
+const TO_ADDR: &str = "seed.bitcoin.sipa.be";
+const PORT: u16 = 8333;
 
-    // Big endian represenation of the "seed.bitcoin.sipa.be" address
-    let ipv6_address: std::net::Ipv6Addr = "::ffff:185.49.141.1".parse().unwrap();
-    let ipv4_mapped_ipv6 = ipv6_address.octets();
-    println!("ipv4_mapped_ipv6: {:?}", ipv4_mapped_ipv6);
+async fn handshake() -> Result<(), Box<dyn std::error::Error>> {
+    let to_addr = format!("{}:{}", TO_ADDR, PORT);
+    let stream = TcpStream::connect(to_addr).await?;
+    let (mut reader, mut writer): (ReadHalf<_>, _) = split(stream);
 
-    // Send a version message to the node
     let version_message = VersionMessage {
         version: PROTOCOL_VERSION,
         services: 1,
-        timestamp: chrono::Utc::now().timestamp() as i64,
+        timestamp: chrono::Utc::now().timestamp(),
         addr_recv: NetworkAddress {
-            services: 1,
-            ip: ipv4_mapped_ipv6,
-            port: 8333,
+            services: 0,
+            ip: [0; 16],
+            port: 0,
         },
         addr_from: NetworkAddress {
             services: 0,
@@ -110,46 +84,83 @@ fn handshake() {
         relay: false,
     };
 
-    let mut buf = Vec::new();
-    // 4	magic	uint32_t	Magic value indicating message origin network, and used to seek to next message when stream state is unknown
-    buf.extend_from_slice(&BTC_MAIN_MAGIC);
-
-    // 12	command	char[12]	ASCII string identifying the packet content, NULL padded (non-NULL padding results in packet rejected)
-    buf.extend_from_slice(&"version".as_bytes());
-    buf.resize(buf.len() + 5, 0);
-
-    // 4	length	uint32_t	Length of payload in number of bytes
-    buf.extend_from_slice(&(version_message.to_bytes().len() as u32).to_le_bytes());
-    // 4	checksum	uint32_t	First 4 bytes of sha256(sha256(payload))
     let version_message_bytes = version_message.to_bytes();
-    let message_sha256 = sha256d::Hash::hash(&version_message_bytes);
-    let first_four_bytes_of_message_sha256: [u8; 4] = [message_sha256[0], message_sha256[1], message_sha256[2], message_sha256[3]];
-    buf.extend_from_slice(&first_four_bytes_of_message_sha256);
-    //  ?	payload	uchar[]	The actual data
-    buf.extend_from_slice(&version_message_bytes);
+    let payload_size = version_message_bytes.len() as u32;
+    let mut payload = Vec::with_capacity(24 + payload_size as usize);
+    payload.extend_from_slice(&BTC_MAIN_MAGIC);
+    payload.extend_from_slice("version\0\0\0\0\0".as_bytes());
+    payload.extend_from_slice(&payload_size.to_le_bytes());
+    payload.extend_from_slice(&sha256d::Hash::hash(&version_message_bytes)[..4]);
+    payload.extend_from_slice(&version_message_bytes);
+    println!("version message payload for sending: {:?}", payload);
 
-    let res = stream.write_all(&buf);
-    println!("Write buf: {:?}", buf);
-    println!("Write res: {:?}", res);
+    writer.write_all(&payload).await?;
+
+    let mut responses = [0; 2084];
+    let mut bytes_read = 0;
 
     loop {
-        let mut reader = BufReader::new(&stream);
-        let mut buf = [0u8; 1024];
-        let res = reader.read(&mut buf).unwrap();
-        println!("Read res: {:?}", buf); // ---> Always empty
+        // Read the remote peer's version message and reply with our own
+        let current_response = &mut responses[bytes_read..];
+        match reader.read(current_response).await {
+            Ok(0) => {
+                return Err("Remote peer disconnected without sending version message".into());
+            }
+            Ok(n) => {
+                bytes_read += n;
+                println!("current_response bytes: {:?}", &current_response[..n]);
+                let command_bytes = &current_response[4..16];
+                let command = std::str::from_utf8(command_bytes)
+                    .unwrap()
+                    .trim_end_matches('\0')
+                    .to_owned();
 
-        let command_bytes = &buf[4..16];
-        println!("command_bytes: {:?}", command_bytes); // ---> Always empty
-    
-        // Parse the command bytes into a string and trim the null characters.
-        let command = std::str::from_utf8(&command_bytes)
-            .unwrap()
-            .trim_end_matches('\0')
-            .to_owned();
+                println!("The returned command is: {:?}", command);
+                if command == "version" {
+                    assert!(validate_message(&current_response[..n]));
 
-        println!("Returned command str: {:?}", command);
+                    let verack_message_bytes = Vec::new();
+                    let payload_size = 0u32;
+                    let mut payload = Vec::with_capacity(24 + payload_size as usize);
+                    payload.extend_from_slice(&BTC_MAIN_MAGIC);
+                    payload.extend_from_slice("verack\0\0\0\0\0\0".as_bytes());
+                    payload.extend_from_slice(&payload_size.to_le_bytes());
+                    payload.extend_from_slice(&sha256d::Hash::hash(&verack_message_bytes)[..4]);
+                    println!("verack response payload: {:?}", payload);
 
-        if res != 0 {break;};
+                    writer.write_all(&payload).await?;
+
+                    return Ok(());
+                } else if command == "verack" {
+                    println!("Never received this message for some reason :/");
+                } else {
+                    return Err("Remote peer disconnected without sending version message".into());
+                }
+            }
+            Err(_) => {
+                return Err("Unexpected error connectecting peer".into());
+            }
+        }
     }
+}
 
+fn validate_message(message: &[u8]) -> bool {
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&message[16..20]);
+    let payload_length = u32::from_le_bytes(bytes);
+    let payload_end = 24 + payload_length;
+    let payload = &message[24..payload_end as usize];
+    let checksum = &message[20..24];
+
+    let hash = &sha256d::Hash::hash(payload);
+    println!("message: {:?}", &message);
+    println!("hash: {:?}", &hash[..4]);
+    println!("checksum: {:?}", &checksum);
+
+    &hash[..4] == checksum
+}
+
+#[tokio::test]
+async fn test_handshake() {
+    assert!(handshake().await.is_ok());
 }
