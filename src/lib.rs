@@ -1,155 +1,124 @@
-use bitcoin::consensus::serialize;
-use bitcoin_hashes::hex::ToHex;
-// use bitcoin::network::message::{NetworkMessage, RawNetworkMessage};
-// use bitcoin::network::message_network::VersionMessage;
-use std::io::Read;
-use std::io::Write;
-use std::io::{BufReader, BufWriter};
-use std::net::TcpStream;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use bitcoin_hashes::{sha256d, Hash};
+use bitcoin::{
+    consensus::{deserialize, encode::serialize},
+    network::{
+        constants::ServiceFlags,
+        message::{NetworkMessage, RawNetworkMessage},
+        message_network::VersionMessage,
+    },
+};
+use chrono::Utc;
+use std::{
+    io::{Error, ErrorKind},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
+use serde::Deserialize;
 
-
-#[test]
-fn test_handshake() {
-    handshake();
-}
-
-const PROTOCOL_VERSION: i32 = 70002;
-// 0xd9b4bef9 is the magic for "main" Bitcoin network
-// const BTC_MAIN_MAGIC: u32 = 3652501241;
 const BTC_MAIN_MAGIC: [u8; 4] = [0xf9, 0xbe, 0xb4, 0xd9];
+const TO_ADDR: &str = "seed.bitcoin.sipa.be";
+const PORT: u16 = 8333;
+const PROTOCOL_VERSION: u32 = 70015;
 
-#[derive(Debug)]
-struct NetworkAddress {
-    ip: [u8; 16],
-    services: u64,
-    port: u16,
+struct BitcoinPeer {
+    socket_addr: SocketAddr,
+    stream: TcpStream,
 }
-impl NetworkAddress {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(26);
-        // IP and Port need to be Big Endian. The IP is already passed as big endian.
-        bytes.extend_from_slice(&self.ip);
-        bytes.extend_from_slice(&self.services.to_le_bytes());
-        bytes.extend_from_slice(&self.port.to_be_bytes());
-        bytes
+
+impl BitcoinPeer {
+    async fn connect(socket_addr: SocketAddr) -> Result<Self, Error> {
+        let stream = TcpStream::connect(socket_addr).await?;
+        Ok(Self {
+            socket_addr,
+            stream,
+        })
+    }
+
+    async fn send_message(&mut self, message: NetworkMessage) -> Result<(), Error> {
+        let raw_message = RawNetworkMessage {
+            magic: u32::from_le_bytes(BTC_MAIN_MAGIC),
+            payload: message,
+        };
+        let bytes = serialize(&raw_message);
+        self.stream.write_all(&bytes).await?;
+        Ok(())
+    }
+
+    async fn read_message(&mut self) -> Result<NetworkMessage, Error> {
+        let mut buffer = [0u8; 1024];
+        self.stream.read(&mut buffer).await?;
+        let mut length_bytes = [0u8; 4];
+        length_bytes.copy_from_slice(&buffer[16..20]);
+        let length = u32::from_le_bytes(length_bytes);
+        let raw_message =
+        match deserialize::<RawNetworkMessage>(&buffer[..24 + length as usize]) {
+            Ok(msg) => msg,
+            Err(_) => return Err(Error::new(
+                // One reason could be an invalid checksum validation performed in the deserialization
+                ErrorKind::InvalidData,
+                "Failed deserializing message",
+            )),
+        };
+        Ok(raw_message.payload)
+    }
+
+    async fn send_version(&mut self) -> Result<(), Error> {
+        let version_message = VersionMessage {
+            version: PROTOCOL_VERSION,
+            services: ServiceFlags::NONE,
+            timestamp: Utc::now().timestamp() as i64,
+            receiver: bitcoin::network::Address::new(
+                &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
+                0.into(),
+            ),
+            sender: bitcoin::network::Address::new(
+                &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
+                0.into(),
+            ),
+            nonce: 0,
+            user_agent: "my-node".to_owned(),
+            start_height: 0,
+            relay: false,
+        };
+        self.send_message(NetworkMessage::Version(version_message))
+            .await?;
+        Ok(())
     }
 }
-#[derive(Debug)]
-struct VersionMessage {
-    // 4	version	int32_t	Identifies protocol version being used by the node
-    version: i32,
-    // 8	services	uint64_t	bitfield of features to be enabled for this connection
-    services: u64,
-    // 8	timestamp	int64_t	standard UNIX timestamp in seconds
-    timestamp: i64,
-    // 26	addr_recv	net_addr	The network address of the node receiving this message
-    addr_recv: NetworkAddress,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::ToSocketAddrs;
 
-    // Fields below require version ≥ 106
-    // 26	addr_from	net_addr	Field can be ignored. This used to be the network address of the node emitting this message, but most P2P implementations send 26 dummy bytes. The "services" field of the address would also be redundant with the second field of the version message.
-    addr_from: NetworkAddress,
-    // 8	nonce	uint64_t	Node random nonce, randomly generated every time a version packet is sent. This nonce is used to detect connections to self.
-    nonce: u64,
-    // ?	user_agent	var_str	User Agent (0x00 if string is 0 bytes long)
-    user_agent: String,
-    // 4	start_height	int32_t	The last block received by the emitting node
-    start_height: i32,
-
-    // Fields below require version ≥ 70001
-    // 1	relay	bool	Whether the remote peer should announce relayed transactions or not, see BIP 0037
-    relay: bool,
-}
-impl VersionMessage {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(85 + self.user_agent.len());
-        bytes.extend_from_slice(&self.version.to_le_bytes());
-        bytes.extend_from_slice(&self.services.to_le_bytes());
-        bytes.extend_from_slice(&self.timestamp.to_le_bytes());
-        bytes.extend_from_slice(&self.addr_recv.to_bytes());
-        bytes.extend_from_slice(&self.addr_from.to_bytes());
-        bytes.extend_from_slice(&self.nonce.to_le_bytes());
-        bytes.extend_from_slice(&(self.user_agent.len() as u8).to_le_bytes());
-        bytes.extend_from_slice(self.user_agent.as_bytes());
-        bytes.extend_from_slice(&self.start_height.to_le_bytes());
-        bytes.extend_from_slice(&(self.relay as u8).to_le_bytes());
-        bytes
-    }
-}
-
-fn handshake() {
-    // Connect to a Bitcoin node on the main network
-    let ip = "seed.bitcoin.sipa.be";
-    let port = 8333;
-    let mut stream = TcpStream::connect((ip, port)).expect("Failed to connect to node");
-
-    // Big endian represenation of the "seed.bitcoin.sipa.be" address
-    let ipv6_address: std::net::Ipv6Addr = "::ffff:185.49.141.1".parse().unwrap();
-    let ipv4_mapped_ipv6 = ipv6_address.octets();
-    println!("ipv4_mapped_ipv6: {:?}", ipv4_mapped_ipv6);
-
-    // Send a version message to the node
-    let version_message = VersionMessage {
-        version: PROTOCOL_VERSION,
-        services: 1,
-        timestamp: chrono::Utc::now().timestamp() as i64,
-        addr_recv: NetworkAddress {
-            services: 1,
-            ip: ipv4_mapped_ipv6,
-            port: 8333,
-        },
-        addr_from: NetworkAddress {
-            services: 0,
-            ip: [0; 16],
-            port: 0,
-        },
-        nonce: 0,
-        user_agent: "".to_string(),
-        start_height: 0,
-        relay: false,
-    };
-
-    let mut buf = Vec::new();
-    // 4	magic	uint32_t	Magic value indicating message origin network, and used to seek to next message when stream state is unknown
-    buf.extend_from_slice(&BTC_MAIN_MAGIC);
-
-    // 12	command	char[12]	ASCII string identifying the packet content, NULL padded (non-NULL padding results in packet rejected)
-    buf.extend_from_slice(&"version".as_bytes());
-    buf.resize(buf.len() + 5, 0);
-
-    // 4	length	uint32_t	Length of payload in number of bytes
-    buf.extend_from_slice(&(version_message.to_bytes().len() as u32).to_le_bytes());
-    // 4	checksum	uint32_t	First 4 bytes of sha256(sha256(payload))
-    let version_message_bytes = version_message.to_bytes();
-    let message_sha256 = sha256d::Hash::hash(&version_message_bytes);
-    let first_four_bytes_of_message_sha256: [u8; 4] = [message_sha256[0], message_sha256[1], message_sha256[2], message_sha256[3]];
-    buf.extend_from_slice(&first_four_bytes_of_message_sha256);
-    //  ?	payload	uchar[]	The actual data
-    buf.extend_from_slice(&version_message_bytes);
-
-    let res = stream.write_all(&buf);
-    println!("Write buf: {:?}", buf);
-    println!("Write res: {:?}", res);
-
-    loop {
-        let mut reader = BufReader::new(&stream);
-        let mut buf = [0u8; 1024];
-        let res = reader.read(&mut buf).unwrap();
-        println!("Read res: {:?}", buf); // ---> Always empty
-
-        let command_bytes = &buf[4..16];
-        println!("command_bytes: {:?}", command_bytes); // ---> Always empty
-    
-        // Parse the command bytes into a string and trim the null characters.
-        let command = std::str::from_utf8(&command_bytes)
+    #[tokio::test]
+    async fn test_handshake() -> Result<(), Error> {
+        let socket_addr = format!("{}:{}", TO_ADDR, PORT)
+            .to_socket_addrs()
             .unwrap()
-            .trim_end_matches('\0')
-            .to_owned();
+            .next()
+            .unwrap();
 
-        println!("Returned command str: {:?}", command);
+        let mut peer = BitcoinPeer::connect(socket_addr).await?;
+        peer.send_version().await?;
+        let mut message = peer.read_message().await?;
+        match message {
+            NetworkMessage::Version(version_message) => {
+                println!("Version Message Returned: {:?}", version_message);
 
-        if res != 0 {break;};
+                let verack_message = NetworkMessage::Verack;
+                peer.send_message(verack_message).await?;
+
+                message = peer.read_message().await?;
+                assert_eq!(message, NetworkMessage::Verack);
+
+                Ok(())
+            }
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                "Expected Version message",
+            )),
+        }
     }
-
 }
